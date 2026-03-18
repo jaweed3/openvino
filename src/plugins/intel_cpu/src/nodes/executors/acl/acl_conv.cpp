@@ -112,13 +112,58 @@ ACLConvolutionExecutor::ACLConvolutionExecutor(const ConvAttrs& attrs,
         } else {
             OPENVINO_THROW("ACLConvolutionExecutor: the executor supports FakeQuantize and Activation post ops only");
         }
-    } else if (attrs.postOps.size() > 1) {
-        OPENVINO_THROW("ACLConvolutionExecutor: ACL does not support more than 1 post op");
+    } else if (attrs.postOps.size() == 2) {
+        const auto* const activation = std::any_cast<ActivationPostOp>(attrs.postOps.data());
+        const auto* const fq = std::any_cast<FakeQuantizePostOp>(&attrs.postOps[1]);
+        if (activation && fq) {
+            activationLayerInfo = getActivationLayerInfo(convertToEltwiseAlgorithm(activation->type()), 
+                                                                                  activation->alpha(), 
+                                                                                  activation->beta(), 
+                                                                                  activation->gamma());
+            fqInputScale = fq->inputScale();
+            fqInputShift = fq->inputShift();
+            fqOutputScale = fq->outputScale();
+            fqOutputShift = fq->outputShift();
+            
+            // ACL destination quantization supports only per-tensor scale/shift.
+            // For per-channel FQ input scales, move channel-wise ratios to weights scales.
+            if (fqInputScale.size() > 1) {
+                const auto baseScale = fqInputScale.front();
+                const bool hasValidBaseScale = std::fabs(baseScale) > std::numeric_limits<float>::epsilon();
+                const bool hasUniformShift = isPerTensorDataWithTolerance(fqInputShift, 0.00005F);
+
+                if (hasValidBaseScale && hasUniformShift) {
+                    std::vector<float> scaleRatios(fqInputScale.size(), 1.0F);
+                    for (std::size_t i = 0; i < fqInputScale.size(); i++) {
+                        scaleRatios[i] = fqInputScale[i] / baseScale;
+                    }
+
+                    multiplyAndBroadcastScales(weightScale, scaleRatios, fqInputScale.size());
+                    fqInputScale = {baseScale};
+                    if (fqInputShift.size() > 1) {
+                        fqInputShift = {fqInputShift.front()};
+                    }
+                }
+            }
+
+            if (fqOutputScale.size() == 1 && fqOutputScale[0] == 1.0F && fqOutputShift.size() == 1 &&
+                fqOutputShift[0] == std::trunc(fqOutputShift[0])) {
+                for (auto& v : fqInputShift) {
+                    v += fqOutputShift[0];
+                }
+                fqOutputShift.clear();
+            }
+
+        } else {
+            OPENVINO_THROW("ACLConvolutionExecutor: expected [Activation, FakeQuantize] order");
+        }
+    } else if (attrs.postOps.size() > 2) {
+        OPENVINO_THROW("ACLConvolutionExecutor: ACL does not support more than 2 post op");
     }
 }
 
 bool ACLConvolutionExecutor::supports(const ConvConfig& config) {
-    VERIFY(config.attrs.postOps.size() <= 1U, UNSUPPORTED_BY_EXECUTOR);
+    VERIFY(config.attrs.postOps.size() <= 2U, UNSUPPORTED_BY_EXECUTOR);
 
     const auto& srcDesc = config.descs.at(ARG_SRC);
     const auto& weiDesc = config.descs.at(ARG_WEI);
@@ -128,7 +173,13 @@ bool ACLConvolutionExecutor::supports(const ConvConfig& config) {
     VERIFY(srcDesc->getShape().getRank() == 4 && weiDesc->getShape().getRank() == 4, UNSUPPORTED_BY_EXECUTOR);
     // isQuantized verifies whether src is u8/i8, weights is i8 and FQ is fused if dst is u8/i8
     // the last requirement is due to ACL int32 accumulation that needs to be requantized by non-trivial scales
-    const bool hasQuantizationPostOp = std::any_cast<FakeQuantizePostOp>(config.attrs.postOps.data()) != nullptr;
+    bool hasQuantizationPostOp = false;
+    if (config.attrs.postOps.size() == 1) {
+        hasQuantizationPostOp = std::any_cast<FakeQuantizePostOp>(config.attrs.postOps.data()) != nullptr;
+    } else if (config.attrs.postOps.size() == 2) {
+        hasQuantizationPostOp = std::any_cast<ActivationPostOp>(config.attrs.postOps.data()) != nullptr &&
+                                            std::any_cast<FakeQuantizePostOp>(&config.attrs.postOps[1]) != nullptr;
+    }
     const bool isQuantizedU8 = srcDesc->getPrecision() == ov::element::u8 &&
                                any_of(weiDesc->getPrecision(), ov::element::u8, ov::element::i8) &&
                                dstDesc->getPrecision() == ov::element::u8 && hasQuantizationPostOp;
