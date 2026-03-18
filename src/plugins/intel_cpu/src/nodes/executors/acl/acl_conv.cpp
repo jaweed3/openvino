@@ -160,6 +160,10 @@ ACLConvolutionExecutor::ACLConvolutionExecutor(const ConvAttrs& attrs,
     } else if (attrs.postOps.size() > 2) {
         OPENVINO_THROW("ACLConvolutionExecutor: ACL does not support more than 2 post op");
     }
+    if (const auto it = memory.find(ARG_ATTR_ZERO_POINTS | ARG_SRC_0); it != memory.end()) {
+        const auto* zpData = static_cast<const uint8_t*>(it->second->getData());
+        srcZeroPoint = static_cast<int32_t>(zpData[0]);
+    }
 }
 
 bool ACLConvolutionExecutor::supports(const ConvConfig& config) {
@@ -202,7 +206,7 @@ arm_compute::Status ACLConvolutionExecutor::validateTensorsInfo(const ACLInfos& 
     //            shift is not supported
     // - destination: scale is formed based on requantization FakeQuantize parameters: scale = 1.0 / input scale
     //                shift = input shift
-    aclMemoryInfos[ACLArgs::ACL_SRC_0]->set_quantization_info(arm_compute::QuantizationInfo(1.0));
+    aclMemoryInfos[ACLArgs::ACL_SRC_0]->set_quantization_info(arm_compute::QuantizationInfo(1.0, srcZeroPoint));
     aclMemoryInfos[ACLArgs::ACL_WEI]->set_quantization_info(
         weightScale.empty() ? arm_compute::QuantizationInfo(1.0F) : arm_compute::QuantizationInfo(weightScale));
     const auto dstPrecision = aclMemoryInfos[ACLArgs::ACL_DST]->data_type() == arm_compute::DataType::QASYMM8_SIGNED
